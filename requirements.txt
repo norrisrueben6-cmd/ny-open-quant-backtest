@@ -1,0 +1,10 @@
+numpy
+pandas
+scipy
+requests
+yfinance
+scikit-learn
+statsmodels
+arch
+hmmlearn
+pandas_market_calendars
