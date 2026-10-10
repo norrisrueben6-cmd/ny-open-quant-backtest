@@ -1,1 +1,56 @@
 
+name: Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Start date (YYYY-MM-DD). About 50 minutes per year of history."
+        type: string
+        default: "2025-01-01"
+      end:
+        description: "End date (YYYY-MM-DD). Leave empty for yesterday."
+        type: string
+        required: false
+        default: ""
+      discord:
+        description: "Post the summary to Discord when finished"
+        type: boolean
+        default: true
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install packages
+        run: pip install -r requirements.txt
+
+      - name: Run backtest
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          BT_START: ${{ inputs.start }}
+          BT_END: ${{ inputs.end }}
+          BT_DISCORD: ${{ inputs.discord }}
+        run: |
+          ARGS="--start $BT_START"
+          if [ -n "$BT_END" ]; then ARGS="$ARGS --end $BT_END"; fi
+          if [ "$BT_DISCORD" = "true" ]; then ARGS="$ARGS --discord"; fi
+          python backtest_full.py $ARGS
+
+      - name: Save results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: |
+            backtest_summary.txt
+            backtest_days.csv
+          if-no-files-found: warn
