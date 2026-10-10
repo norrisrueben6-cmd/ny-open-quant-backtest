@@ -214,6 +214,11 @@ def main():
     logging.getLogger("quant").setLevel(logging.ERROR)
     end = datetime.strptime(a.end, "%Y-%m-%d").date() if a.end else (datetime.now(q.ET).date() - timedelta(days=1))
     start = datetime.strptime(a.start, "%Y-%m-%d").date() if a.start else end - timedelta(days=365)
+    if end < start:
+        raise SystemExit(f"End date {end} is before start date {start}. Leave 'end' empty to run up to yesterday.")
+    if (end - start).days < 5:
+        raise SystemExit(f"Only {(end - start).days + 1} calendar day(s) between {start} and {end} - that's too short to test. "
+                         "Leave 'end' empty to run up to yesterday, or pick an end date at least a few weeks later.")
     cfg = q.Config()
     q.MODULES = [(fn, k) for fn, k in q.MODULES if k not in SKIP]
     q.RUN_ORDER = [k for k in q.RUN_ORDER if k not in SKIP]
@@ -238,6 +243,9 @@ def main():
             pd.DataFrame(rows).sort_values("date").to_csv(OUT_CSV, index=False)
             per = (time.time() - t0) / n
             log.info("%d/%d days  (%.1fs per day, ~%.0f min left)", n, len(todo), per, per * (len(todo) - n) / 60)
+    if not rows:
+        raise SystemExit(f"No trading days could be run between {start} and {end} (holidays/weekends only, or the "
+                         "data download failed). Check the dates and try again.")
     D = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
     D.to_csv(OUT_CSV, index=False)
     txt = summarise(D)
