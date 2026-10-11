@@ -1,18 +1,17 @@
-
 name: Backtest
 
 on:
   workflow_dispatch:
     inputs:
       start:
-        description: "Start date (YYYY-MM-DD). About 50 minutes per year of history."
+        description: "Start date (YYYY-MM-DD)"
         type: string
-        default: "2025-01-01"
+        default: "2026-07-01"
       end:
         description: "End date (YYYY-MM-DD). Leave empty for yesterday."
         type: string
         required: false
-        default: ""
+        default: "2026-09-30"
       discord:
         description: "Post the summary to Discord when finished"
         type: boolean
@@ -31,7 +30,7 @@ jobs:
           cache: pip
 
       - name: Install packages
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pyarrow
 
       - name: Run backtest
         env:
@@ -53,4 +52,5 @@ jobs:
           path: |
             backtest_summary.txt
             backtest_days.csv
+            backtest_trades.csv
           if-no-files-found: warn
