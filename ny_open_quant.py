@@ -135,6 +135,9 @@ class Config:
     as_k: float = 100.0            # Avellaneda-Stoikov order-arrival decay
     bias_threshold: float = 0.12   # |composite| above this -> UP / DOWN call
     as_of: Optional[str] = None    # 'YYYY-MM-DD' -> replay that day's open with only data known then
+    # reversal-level trades in the morning card
+    stop_pts: float = 35.0         # NQ points beyond the level
+    target_pts: float = 150.0      # NQ points from the entry (TP2); TP1 = back to the open
     ppo: bool = False
     demo: bool = False
     dry_run: bool = False
@@ -173,6 +176,7 @@ class Ctx:
     smile_term: Optional[pd.DataFrame] = None
     notes: List[str] = field(default_factory=list)
     info: Dict[str, object] = field(default_factory=dict)   # facts other models hand to the game plan
+    premkt: Optional[pd.DataFrame] = None                    # today's pre-market 1-minute bars (live only)
 
     @property
     def prev_close(self) -> float:
@@ -390,7 +394,7 @@ def load_live(cfg: Config) -> Ctx:
         d0 = datetime.strptime(cfg.as_of, "%Y-%m-%d").date()
         now = datetime(d0.year, d0.month, d0.day, 9, 30, 20, tzinfo=ET)
     today = now.date()
-    tickers = [cfg.equity, cfg.pair, "IWM", "TLT", "GLD", "IWD", "IWF", "MTUM", "^VIX", "^IRX", "^FVX", "^TNX", "^TYX", cfg.futures]
+    tickers = [cfg.equity, cfg.pair, "IWM", "TLT", "GLD", "IWD", "IWF", "MTUM", "^VIX", "^IRX", "^FVX", "^TNX", "^TYX", cfg.futures] + EXTRA_TICKERS
     tickers = list(dict.fromkeys(tickers))
     if cfg.as_of:
         start = (today - timedelta(days=int(365.25 * cfg.years) + 10)).isoformat()
@@ -406,6 +410,7 @@ def load_live(cfg: Config) -> Ctx:
     # latest price (pre-market / open)
     spot = float(ohlc["close"].iloc[-1])
     actual = None
+    premkt_bars = None
     if cfg.as_of:
         day = raw.loc[raw.index.date == today]
         if day.empty or pd.isna(day["Open"][cfg.equity].iloc[0]):
@@ -418,6 +423,9 @@ def load_live(cfg: Config) -> Ctx:
         m1 = _flat(yf.download(cfg.equity, period="1d", interval="1m", prepost=True, auto_adjust=True, progress=False))
         if len(m1):
             spot = float(m1["Close"].dropna().iloc[-1])
+            idx = m1.index.tz_convert(ET) if m1.index.tz is not None else m1.index.tz_localize(ET)
+            pm = m1[(idx.date == today) & (idx.time < datetime(2000, 1, 1, 9, 30).time())]
+            premkt_bars = pm.rename(columns=str.lower) if len(pm) else None
     except Exception as e:
         if not cfg.as_of:
             log.warning("1m spot fetch failed: %s", e)
@@ -438,6 +446,7 @@ def load_live(cfg: Config) -> Ctx:
         pass
     rf = float(px["^IRX"].dropna().iloc[-1]) / 100.0 if "^IRX" in px else 0.04
     ctx = Ctx(cfg=cfg, now=now, px=px, ohlc=ohlc, intra=intra, spot=spot, fut_ratio=fut_ratio, rf=rf, q=cfg.div_yield)
+    ctx.premkt = premkt_bars
     if cfg.as_of:
         ctx.info["actual"] = actual
         ctx.notes.append(f"REPLAY of {today}: only data available before that open was used. "
@@ -495,6 +504,7 @@ def make_demo(cfg: Config) -> Ctx:
     now = datetime.now(ET)
     n = cfg.years * 252
     idx = pd.bdate_range(end=(now - timedelta(days=1)).date(), periods=n)
+    n = len(idx)                                   # pandas can return one fewer day near weekends
     dt = 1 / TD
     kappa, theta, xi, rho = 4.0, 0.045, 0.7, -0.75
     v, ret, vs = 0.04, np.empty(n), np.empty(n)
@@ -1910,6 +1920,8 @@ def run_all(c: Ctx) -> List[Result]:
             log.warning("%s failed: %s", key, e)
             log.debug(traceback.format_exc())
             r = Result(key, title, sec, ok=False, headline=f"skipped - {type(e).__name__}: {e}"[:200])
+        if r.ok and key in WEIGHT_OVERRIDE:
+            r.weight = WEIGHT_OVERRIDE[key]
         out[key] = r
     return [out[k] for _, k in MODULES]
 
@@ -1956,6 +1968,293 @@ def compose(res: List[Result], c: Ctx) -> Composite:
         ("Stretched downside", S * math.exp(-2 * move), f"a 2-sigma drop; only ~{p2:.0f}% of days close below, so it's a capitulation zone"),
     ]
     return Composite(score, p_up, verdict, agree, move, parts, center, lv)
+
+
+# =============================================================================
+# DESK CONTEXT -- confluence filters, read together the way a trading desk reads the tape
+# =============================================================================
+EXTRA_TICKERS = ["^VXN", "^VIX9D", "^VIX3M", "HYG", "LQD", "DX-Y.NYB", "SMH"]
+
+# Vote weights re-set from the full walk-forward backtest (backtest_full.py, Jan-2025 -> Oct-2026):
+# tree models were the only clearly-above-chance vote (56.8%); factors / Markowitz / Avellaneda-Stoikov
+# were below 50%; ARIMA, GBM and Heston drift were coin flips or always-long.
+WEIGHT_OVERRIDE = {"trees": 2.0, "hmm": 0.5, "garch": 0.5, "arima": 0.2, "heston": 0.2, "gbm": 0.1,
+                   "factors": 0.0, "markowitz": 0.0, "as": 0.0}
+
+
+def _last(px, t, back=0):
+    if t not in px:
+        return float("nan")
+    s_ = px[t].dropna()
+    return float(s_.iloc[-1 - back]) if len(s_) > back else float("nan")
+
+
+def _lchg(px, t, n):
+    a, b = _last(px, t), _last(px, t, n)
+    return math.log(a / b) if a == a and b == b and a > 0 and b > 0 else float("nan")
+
+
+def _ok(x):
+    return x is not None and not (isinstance(x, float) and math.isnan(x))
+
+
+def dealer_gamma(c: Ctx) -> Optional[dict]:
+    """Dealer gamma exposure from the live chain (SqueezeMetrics convention: customers buy calls and puts,
+    so dealers are long call gamma and short put gamma). GEX = sum gamma x OI x 100 x S^2 x 1%  (in $ per 1% move).
+    Also: gamma flip (spot where total GEX changes sign), call wall, put wall, max pain, put/call ratios."""
+    S, r, q = c.spot, c.rf, c.q
+    K_, sgn, oi_, iv_, T_, vol_ = [], [], [], [], [], []
+    near_rows = []
+    for name in ("near", "term"):
+        ch = getattr(c, name)
+        if ch is None:
+            continue
+        df, T = ch["df"], ch["T"]
+        for _, o in df.iterrows():
+            oi = float(o.get("openInterest", 0) or 0)
+            K = float(o["strike"])
+            if oi <= 0 or not (0.85 * S < K < 1.15 * S):
+                continue
+            iv = float(o.get("impliedVolatility", 0) or 0)
+            if not (0.03 < iv < 3.0):
+                m = _mid(o)
+                iv = iv_brent(m, S, K, T, r, q, o["kind"])[0] if m > 0.02 else float("nan")
+            if not _ok(iv):
+                continue
+            K_.append(K); sgn.append(1.0 if o["kind"] == "c" else -1.0); oi_.append(oi); iv_.append(iv); T_.append(T)
+            vol_.append(float(o.get("volume", 0) or 0))
+            if name == "near":
+                near_rows.append((K, o["kind"], oi))
+    if len(K_) < 12:
+        return None
+    K_, sgn, oi_, iv_, T_, vol_ = map(np.asarray, (K_, sgn, oi_, iv_, T_, vol_))
+
+    def gamma_at(Sx):
+        sT = iv_ * np.sqrt(T_)
+        d1 = (np.log(Sx / K_) + (r - q + 0.5 * iv_ ** 2) * T_) / sT
+        return np.exp(-q * T_) * np.exp(-0.5 * d1 ** 2) / np.sqrt(2 * np.pi) / (Sx * sT)
+
+    def gex(Sx):
+        return float(np.sum(sgn * gamma_at(Sx) * oi_ * 100 * Sx * Sx * 0.01))
+    g0 = gex(S)
+    grid = np.linspace(0.92 * S, 1.08 * S, 161)
+    vals = np.array([gex(x) for x in grid])
+    flips = [grid[i] - vals[i] * (grid[i + 1] - grid[i]) / (vals[i + 1] - vals[i])
+             for i in range(len(grid) - 1) if np.sign(vals[i]) != np.sign(vals[i + 1])]
+    flip = min(flips, key=lambda x: abs(x - S)) if flips else None
+    per = pd.DataFrame({"K": K_, "g": gamma_at(S) * oi_, "s": sgn})
+    calls = per[(per.s > 0) & (per.K > S)].groupby("K").g.sum()
+    puts = per[(per.s < 0) & (per.K < S)].groupby("K").g.sum()
+    call_wall = float(calls.idxmax()) if len(calls) else None
+    put_wall = float(puts.idxmax()) if len(puts) else None
+    max_pain = None
+    if near_rows:
+        nr = pd.DataFrame(near_rows, columns=["K", "kind", "oi"])
+        strikes = np.sort(nr.K.unique())
+        pay = [float((nr[nr.kind == "c"].oi * np.maximum(k - nr[nr.kind == "c"].K, 0)).sum()
+                     + (nr[nr.kind == "p"].oi * np.maximum(nr[nr.kind == "p"].K - k, 0)).sum()) for k in strikes]
+        max_pain = float(strikes[int(np.argmin(pay))])
+    c_oi, p_oi = oi_[sgn > 0].sum(), oi_[sgn < 0].sum()
+    c_v, p_v = vol_[sgn > 0].sum(), vol_[sgn < 0].sum()
+    return dict(gex=g0, flip=flip, call_wall=call_wall, put_wall=put_wall, max_pain=max_pain,
+                pc_oi=p_oi / c_oi if c_oi > 0 else float("nan"), pc_vol=p_v / c_v if c_v > 0 else float("nan"))
+
+
+def _third_friday(y, m):
+    from datetime import date as D
+    d = D(y, m, 1)
+    d += timedelta(days=(4 - d.weekday()) % 7)
+    return d + timedelta(days=14)
+
+
+def desk_context(c: Ctx, k: Composite) -> dict:
+    """Every confluence filter, then the regimes they imply. Cached in c.info['desk']."""
+    if "desk" in c.info:
+        return c.info["desk"]
+    S, px, o, m = c.spot, c.px, c.ohlc, max(k.move, 1e-6)
+    cl, hi, lo = o["close"], o["high"], o["low"]
+    d: Dict[str, object] = {}
+    # --- trend & stretch ---
+    for n in (20, 50, 200):
+        d[f"sma{n}"] = float(cl.iloc[-n:].mean()) if len(cl) >= n else float("nan")
+    d["mom21"] = math.log(cl.iloc[-1] / cl.iloc[-22]) if len(cl) > 22 else float("nan")
+    d["mom63"] = math.log(cl.iloc[-1] / cl.iloc[-64]) if len(cl) > 64 else float("nan")
+    sd20 = float(cl.iloc[-20:].std())
+    d["z20"] = (S - d["sma20"]) / sd20 if sd20 > 0 else float("nan")
+    d["rsi2"] = float(_rsi(cl, 2).iloc[-1])
+    # --- yesterday's structure ---
+    d["pdh"], d["pdl"], d["pdc"] = float(hi.iloc[-1]), float(lo.iloc[-1]), float(cl.iloc[-1])
+    tr = pd.concat([hi - lo, (hi - cl.shift()).abs(), (lo - cl.shift()).abs()], axis=1).max(axis=1)
+    d["atr14"] = float(tr.iloc[-14:].mean())
+    rng = (hi - lo).iloc[-7:]
+    d["nr7"] = bool(len(rng) == 7 and rng.iloc[-1] <= rng.min() + 1e-12)
+    d["prior_vwap"] = d["prior_poc"] = float("nan")
+    if c.intra is not None and len(c.intra):
+        it = c.intra
+        dates = (it.index.tz_convert(ET) if it.index.tz is not None else it.index).date
+        last = it[dates == dates[-1]]
+        if len(last) > 10 and "volume" in last:
+            tp = (last["high"] + last["low"] + last["close"]) / 3
+            v = last["volume"].astype(float)
+            if v.sum() > 0:
+                d["prior_vwap"] = float((tp * v).sum() / v.sum())
+                b = (tp / 0.25).round() * 0.25
+                d["prior_poc"] = float(v.groupby(b).sum().idxmax())
+    d["pm_high"] = d["pm_low"] = float("nan")
+    if c.premkt is not None and len(c.premkt) > 5:
+        d["pm_high"], d["pm_low"] = float(c.premkt["high"].max()), float(c.premkt["low"].min())
+    # --- overnight gap ---
+    d["gap"] = S / c.prev_close - 1
+    d["gap_z"] = d["gap"] / m
+    # --- volatility complex ---
+    vix, v9, v3, vxn = (_last(px, t) for t in ("^VIX", "^VIX9D", "^VIX3M", "^VXN"))
+    d.update(vix=vix, vix9d=v9, vix3m=v3, vxn=vxn,
+             ts_front=v9 / vix if _ok(v9) and _ok(vix) and vix > 0 else float("nan"),
+             ts_back=vix / v3 if _ok(vix) and _ok(v3) and v3 > 0 else float("nan"))
+    # --- cross-asset ---
+    d["credit5"] = _lchg(px, "HYG", 5) - _lchg(px, "LQD", 5)
+    d["dxy5"] = _lchg(px, "DX-Y.NYB", 5)
+    t10a, t10b = _last(px, "^TNX"), _last(px, "^TNX", 5)
+    d["y10_5d_bp"] = (t10a - t10b) * 100 if _ok(t10a) and _ok(t10b) else float("nan")
+    d["semis5"] = _lchg(px, "SMH", 5) - _lchg(px, c.cfg.equity, 5)
+    d["vs_spy5"] = _lchg(px, c.cfg.equity, 5) - _lchg(px, c.cfg.pair, 5)
+    # --- options positioning ---
+    g = None
+    try:
+        g = dealer_gamma(c)
+    except Exception as e:
+        log.warning("dealer gamma failed: %s", e)
+    d["gamma"] = g
+    # --- calendar ---
+    today = c.now.date()
+    tf = _third_friday(today.year, today.month)
+    d["opex_week"] = 0 <= (tf - today).days <= 4
+    d["opex_day"] = today == tf
+    month_days = [x for x in pd.bdate_range(today.replace(day=1), periods=23) if x.month == today.month]
+    pos = [x.date() for x in month_days].index(today) if today in [x.date() for x in month_days] else 5
+    d["turn_of_month"] = pos <= 2 or pos >= len(month_days) - 1
+
+    # ================= regimes =================
+    i = c.info
+    stress = 0
+    stress += 2 if _ok(d["ts_back"]) and d["ts_back"] > 1.0 else 0
+    stress += 1 if _ok(d["ts_front"]) and d["ts_front"] > 1.05 else 0
+    stress += 1 if i.get("garch_pctl", 0.5) > 0.80 else 0
+    stress += 1 if str(i.get("hmm_state", "")).startswith("STRESS") and i.get("hmm_prob", 0) > 0.6 else 0
+    stress += 1 if _ok(vxn) and vxn > 30 else 0
+    calm = (_ok(d["ts_back"]) and d["ts_back"] < 0.92) + (i.get("garch_pctl", 0.5) < 0.35)
+    d["vol_regime"] = "stressed" if stress >= 3 else "elevated" if stress >= 1 else "calm" if calm >= 1 else "normal"
+
+    d["gamma_regime"] = "unknown"
+    if g:
+        if g["gex"] > 0 and (g["flip"] is None or S > g["flip"]):
+            d["gamma_regime"] = "long"
+        elif g["gex"] < 0 or (g["flip"] is not None and S < g["flip"]):
+            d["gamma_regime"] = "short"
+
+    s50, s200 = d["sma50"], d["sma200"]
+    if _ok(s200) and S > s50 > s200 and d["mom63"] > 0:
+        d["trend"] = "uptrend"
+    elif _ok(s200) and S < s50 < s200 and d["mom63"] < 0:
+        d["trend"] = "downtrend"
+    else:
+        d["trend"] = "range"
+
+    ra = 0.0
+    for val, w in ((d["credit5"], 1.0), (-d["dxy5"] if _ok(d["dxy5"]) else float("nan"), 0.5),
+                   (-d["y10_5d_bp"] if _ok(d["y10_5d_bp"]) else float("nan"), 0.5), (d["semis5"], 1.0)):
+        if _ok(val) and abs(val) > 1e-9:
+            ra += w * math.copysign(1, val)
+    d["risk_score"] = ra
+    d["risk"] = "risk-on" if ra >= 1.5 else "risk-off" if ra <= -1.5 else "mixed"
+
+    if (_ok(d["rsi2"]) and d["rsi2"] > 90) or (_ok(d["z20"]) and d["z20"] > 2):
+        d["stretch"] = "stretched up"
+    elif (_ok(d["rsi2"]) and d["rsi2"] < 10) or (_ok(d["z20"]) and d["z20"] < -2):
+        d["stretch"] = "stretched down"
+    else:
+        d["stretch"] = "not stretched"
+
+    why = []
+    if d["vol_regime"] == "stressed":
+        why.append("volatility is stressed")
+    if d["gamma_regime"] == "short":
+        why.append("dealers are short gamma")
+    if d["nr7"]:
+        why.append("yesterday was the narrowest range in 7 days (NR7, ranges tend to expand after)")
+    if abs(d["gap_z"]) > 0.75:
+        why.append(f"the opening gap is already {abs(d['gap_z'])*100:.0f}% of a normal day")
+    if why:
+        d["day_type"], d["stance"] = "EXPANSION / TREND DAY", "trade breaks with confirmation, don't fade, smaller size"
+    elif d["gamma_regime"] == "long" and d["vol_regime"] in ("calm", "normal"):
+        d["day_type"], d["stance"] = "MEAN-REVERSION / RANGE DAY", "buy confirmed dips into support, take profits into resistance"
+        why = ["dealers are long gamma (they sell rips and buy dips, dampening moves)", f"volatility is {d['vol_regime']}"]
+    else:
+        d["day_type"], d["stance"] = "BALANCED DAY", "wait for price to reach a confluence zone before acting"
+        why = [f"volatility is {d['vol_regime']}"] + (["dealer gamma is unavailable"] if d["gamma_regime"] == "unknown" else [])
+    d["day_why"] = why
+
+    # directional context agreement with the bias
+    side = 1 if k.verdict == "UP" else -1 if k.verdict == "DOWN" else 0
+    votes = {"trend": {"uptrend": 1, "downtrend": -1}.get(d["trend"], 0),
+             "cross-asset": {"risk-on": 1, "risk-off": -1}.get(d["risk"], 0),
+             "stretch (mean reversion)": {"stretched up": -1, "stretched down": 1}.get(d["stretch"], 0)}
+    if g and _ok(g.get("max_pain")):
+        votes["options pin (max pain)"] = 1 if g["max_pain"] > S * (1 + 0.15 * m) else -1 if g["max_pain"] < S * (1 - 0.15 * m) else 0
+    d["ctx_votes"] = votes
+    lean = sum(votes.values())
+    d["ctx_lean"] = lean
+    if side:
+        agree = sum(1 for v in votes.values() if v == side)
+        against = sum(1 for v in votes.values() if v == -side)
+        d["conviction"] = "high" if agree >= 2 and against == 0 else "low" if against >= agree else "medium"
+        d["agree"], d["against"] = agree, against
+    else:
+        d["conviction"] = "n/a"
+        d["agree"] = d["against"] = 0
+    c.info["desk"] = d
+    return d
+
+
+def confluence_zones(c: Ctx, k: Composite) -> List[dict]:
+    """Every level from every method, clustered into zones; a zone is stronger when independent methods agree."""
+    S, m, d = c.spot, max(k.move, 1e-6), desk_context(c, k)
+    src = []
+    for v, nm, what, react in level_ladder(c, k):
+        if nm in ("OPEN", "ML CLOSE TARGET"):
+            continue
+        fam = "order flow (Hawkes)" if "MOMENTUM" in nm else "relative value" if "FAIR" in nm else "volatility model"
+        src.append(dict(price=v, name=nm, family=fam, react=react, what=what))
+    add = [("pdh", "PRIOR-DAY HIGH", "yesterday's structure"), ("pdl", "PRIOR-DAY LOW", "yesterday's structure"),
+           ("pdc", "PRIOR CLOSE", "yesterday's structure"), ("prior_vwap", "PRIOR-SESSION VWAP", "yesterday's volume"),
+           ("prior_poc", "PRIOR-SESSION POC", "yesterday's volume"), ("pm_high", "PREMARKET HIGH", "overnight structure"),
+           ("pm_low", "PREMARKET LOW", "overnight structure"), ("sma20", "20-DAY AVERAGE", "trend averages"),
+           ("sma50", "50-DAY AVERAGE", "trend averages"), ("sma200", "200-DAY AVERAGE", "trend averages")]
+    for key, nm, fam in add:
+        v = d.get(key)
+        if _ok(v) and abs(math.log(v / S)) < 2.5 * m:
+            src.append(dict(price=float(v), name=nm, family=fam, react="", what=""))
+    g = d.get("gamma")
+    if g:
+        for key, nm in (("flip", "GAMMA FLIP"), ("call_wall", "CALL WALL"), ("put_wall", "PUT WALL"), ("max_pain", "MAX PAIN")):
+            v = g.get(key)
+            if _ok(v) and abs(math.log(v / S)) < 2.5 * m:
+                src.append(dict(price=float(v), name=nm, family="options positioning", react="", what=""))
+    src.sort(key=lambda x: x["price"])
+    zones, tol = [], 0.15 * m * S
+    for x in src:
+        if zones and x["price"] - zones[-1]["hi"] <= tol:
+            zones[-1]["items"].append(x)
+            zones[-1]["hi"] = x["price"]
+        else:
+            zones.append(dict(lo=x["price"], hi=x["price"], items=[x]))
+    for z in zones:
+        z["price"] = float(np.mean([x["price"] for x in z["items"]]))
+        z["families"] = sorted(set(x["family"] for x in z["items"]))
+        z["names"] = [x["name"] for x in z["items"]]
+        main = next((x for x in z["items"] if x["family"] == "volatility model"), z["items"][0])
+        z["main"] = main
+    return zones
 
 
 def fut(c: Ctx, x: float) -> str:
@@ -2027,6 +2326,10 @@ def donts_list(c: Ctx, k: Composite) -> List[str]:
         donts.append(f"Don't trade full size: volatility is busier than {pctl*100:.0f}% of past days (GARCH), so stops get hit more easily.")
     if str(info.get("hmm_state", "")).startswith("STRESS") and info.get("hmm_prob", 0) > 0.6:
         donts.append("Don't assume dips get bought: the market-state model says we're in a high-volatility phase, where moves run further than usual.")
+    donts.append("Don't short into the upside limit or extreme high: in the 2025-26 backtest that trade lost 2,069 NQ points (39% win rate).")
+    dk = desk_context(c, k)
+    if dk.get("conviction") == "low":
+        donts.append(f"Don't size up on the {k.verdict.lower()} bias: the context ({', '.join(n for n, v in dk['ctx_votes'].items() if v and v != (1 if k.verdict == 'UP' else -1))}) disagrees with it.")
     if k.verdict == "UP":
         donts.append(f"Don't short just because it looks high: below {f(lv['Implied upside base'])} the bias favours buyers.")
     elif k.verdict == "DOWN":
@@ -2047,11 +2350,11 @@ def level_ladder(c: Ctx, k: Composite) -> List[Tuple[float, str, str, str]]:
         (lv["Stretched upside"], "EXTREME HIGH", f"A 2-sigma rally (twice a normal day). {p2.capitalize()} days close above this.",
          "Take most profits on longs; don't chase higher." if up else
          "If price gets here, the down bias is wrong. Get out of shorts." if dn else
-         "Very stretched. Only consider a small short if price stalls here."),
+         "Very stretched. Take profits on longs here; don't open shorts."),
         (lv["Implied upside base"], "UPSIDE LIMIT", f"The top of a normal day (1-sigma). {p1.capitalize()} days close above this.",
          f"First profit target for longs. A strong break above opens the way to {f(lv['Stretched upside'])}." if up else
-         "Best area to look for shorts: wait for price to stall (a 5-min candle closing back below)." if dn else
-         "Top of today's likely range. Sell rallies here rather than buy them."),
+         "Rallies tend to stall here on down-bias days. Don't buy here; don't short it either (shorting this level lost money in testing)." if dn else
+         "Top of today's likely range. Take profits on longs here; don't open shorts (shorting it lost money in testing)."),
         (S, "OPEN", "Today's opening price, the reference point for the bias.",
          "Holding above here keeps the up bias alive; losing it early is a warning sign." if up else
          "Staying below here keeps the down bias alive; reclaiming it is a warning sign." if dn else
@@ -2107,48 +2410,42 @@ SIDE_ADJ = {"down": 1.15, "up": 0.85}
 
 
 def best_levels(c: Ctx, k: Composite, n: int = 3) -> List[dict]:
-    """Rank today's levels by (chance price trades there) x (confluence with other models) x (bias relevance)."""
+    """Rank confluence zones by (chance price trades there) x (how many independent methods agree) x (bias relevance)."""
     S, m = c.spot, max(k.move, 1e-6)
-    ladder = level_ladder(c, k)
-    others = [(v, nm) for v, nm, _, _ in ladder if nm not in ("OPEN",)]
-    cand = [(v, nm, what, react) for v, nm, what, react in ladder if nm not in ("OPEN", "ML CLOSE TARGET")]
+    d = desk_context(c, k)
     out = []
-    for v, nm, what, react in cand:
-        x = abs(math.log(v / S))
+    for z in confluence_zones(c, k):
+        x = abs(math.log(z["price"] / S))
         if x < 0.3 * m:
-            continue                                            # too close to the open to be a decision level
-        side = "up" if v > S else "down"
-        p_touch = min(0.95, 2 * (1 - float(Ncdf(x / (TOUCH_SCALE * m)))) * SIDE_ADJ[side])
-        near = [o for ov, o in others if o != nm and abs(math.log(ov / v)) <= 0.2 * m]
-        conf = 1 + 0.5 * len(near)
-        bias_w = 1.25 if (k.verdict == "UP" and side == "down") or (k.verdict == "DOWN" and side == "up") else 1.0
-        why = [f"{'under 1' if p_touch < 0.01 else f'{p_touch*100:.0f}'}% chance price trades here today"]
-        if near:
-            why.append("lines up with the " + " and ".join(x.lower() for x in near))
-        if bias_w > 1:
-            why.append(f"it's where the {k.verdict.lower()} bias says to act")
-        out.append(dict(price=v, name=nm, p=p_touch, score=p_touch * conf * bias_w, why="; ".join(why),
-                        react=react, history=LEVEL_HISTORY.get(nm, "")))
-    out.sort(key=lambda d: -d["score"])
-    picked: List[dict] = []
-    for d in out:                                               # merge levels within 0.2 sigma into one zone
-        twin = next((p for p in picked if abs(math.log(p["price"] / d["price"])) <= 0.2 * m), None)
-        if twin is not None:
-            if "zone" not in twin:
-                lo_, hi_ = sorted([twin["price"], d["price"]])
-                twin["zone"] = (lo_, hi_)
-                twin["name"] = f"{twin['name']} + {d['name']}"
-                if d["history"]:
-                    twin["history"] = (twin["history"] + "; " if twin["history"] else "") + d["history"]
             continue
-        if len(picked) >= 2 and d["p"] < 0.03:
-            continue                                            # a 3rd level must have a realistic chance of being reached
-        picked.append(d)
+        side = "up" if z["price"] > S else "down"
+        p_touch = min(0.95, 2 * (1 - float(Ncdf(x / (TOUCH_SCALE * m)))) * SIDE_ADJ[side])
+        nf = len(z["families"])
+        bias_w = 1.25 if (k.verdict == "UP" and side == "down") or (k.verdict == "DOWN" and side == "up") else 1.0
+        why = f"{'under 1' if p_touch < 0.01 else f'{p_touch*100:.0f}'}% chance price trades here today"
+        if nf >= 2:
+            parts = []
+            for fam in z["families"]:
+                nm = ", ".join(x_["name"].lower() for x_ in z["items"] if x_["family"] == fam)
+                parts.append(f"{fam} ({nm})")
+            why += f"; {nf} independent methods agree: " + "; ".join(parts)
+        if bias_w > 1:
+            why += f"; it's where the {k.verdict.lower()} bias says to act"
+        hist = "; ".join(LEVEL_HISTORY[x_["name"]] for x_ in z["items"] if x_["name"] in LEVEL_HISTORY)
+        names = list(dict.fromkeys(z["names"]))
+        rec = dict(price=z["price"], name=" + ".join(names), p=p_touch, families=z["families"],
+                   score=p_touch * (1 + 0.6 * (nf - 1)) * bias_w, why=why, react=z["main"]["react"], history=hist)
+        if z["hi"] - z["lo"] > 1e-9:
+            rec["zone"] = (z["lo"], z["hi"])
+        out.append(rec)
+    out.sort(key=lambda r_: -r_["score"])
+    picked = []
+    for r_ in out:
+        if len(picked) >= 2 and r_["p"] < 0.03:
+            continue
+        picked.append(r_)
         if len(picked) == n:
             break
-    for d in picked:
-        d["why"] = d["why"].split("; lines up with")[0] + ("; two models agree on this zone" if "zone" in d else "") \
-            + ("; " + d["why"].split("; ", 1)[1] if "bias says" in d["why"] else "")
     return picked
 
 
@@ -2172,42 +2469,47 @@ def exec_plan(c: Ctx, k: Composite, b: dict) -> List[str]:
     extreme = "EXTREME" in name
     edge = hi_ if below else lo_                             # first price you meet coming from the open
     far = lo_ if below else hi_
-    # ---- scenario A: stall / consolidation -> fade ----
-    a_side = "long" if below else "short"
-    a_stop = far - 0.5 * m * S if below else far + 0.5 * m * S
-    if extreme:
-        a_tgt = lv["Implied downside base"] if below else lv["Implied upside base"]
-    elif (k.verdict == "UP" and below) or (k.verdict == "DOWN" and not below):
-        a_tgt = lv["Implied upside base"] if below else lv["Implied downside base"]
+    d = desk_context(c, k)
+    day = d["day_type"]
+    if below:
+        # ---- scenario A: stall / consolidation at support -> buy ----
+        a_stop = far - 0.5 * m * S
+        a_tgt = lv["Implied downside base"] if extreme else (lv["Implied upside base"] if k.verdict == "UP" else S)
+        a_rr = abs(a_tgt - edge) / max(abs(edge - a_stop), 1e-9)
+        a = (f"A) IF IT STALLS / CONSOLIDATES THERE -> LONG{' (small size)' if extreme else ''}: wait for price to reach {px(edge)}, "
+             f"then for a 5-min candle to close back above it (or 2-3 small 5-min candles with no new low). "
+             f"Then place a LIMIT buy at {px(edge)} for the retest. Stop {px(a_stop)} ({pts(edge - a_stop)} risk). "
+             f"Target {px(a_tgt)} ({pts(a_tgt - edge)}, about 1:{a_rr:.1f}). If it never comes back to your limit, skip it.")
     else:
-        a_tgt = S
-    a_rr = abs(a_tgt - edge) / max(abs(edge - a_stop), 1e-9)
-    a = (f"A) IF IT STALLS / CONSOLIDATES THERE -> {a_side.upper()}{' (small size)' if extreme else ''}: wait for price to reach "
-         f"{px(edge)}, then for a 5-min candle to close back {'above' if below else 'below'} it (or 2-3 small 5-min candles "
-         f"holding without a new {'low' if below else 'high'}). Then place a LIMIT {'buy' if below else 'sell'} at {px(edge)} for the retest. "
-         f"Stop {px(a_stop)} ({pts(edge - a_stop)} risk). Target {px(a_tgt)} ({pts(a_tgt - edge)}, about 1:{a_rr:.1f}). "
-         f"If it never comes back to your limit, skip it - don't chase with a market order.")
+        # ---- upside: no shorts (shorting the upside limit lost 2,069 NQ pts in the 2025-26 backtest) ----
+        a = (f"A) IF IT STALLS THERE -> TAKE PROFIT, DON'T SHORT: if you're long, take profits into {px(edge)}. "
+             f"Don't open a short into upside levels: in the 2025-26 backtest, shorting the upside limit lost 2,069 NQ points (39% win rate).")
     lines = [a]
-    if not extreme:
-        # ---- scenario B: fast break + hold -> follow ----
+    if not extreme or not below:
         nxt = lv["Stretched downside"] if below else lv["Stretched upside"]
-        b_trig = far - 0.1 * m * S if below else far + 0.1 * m * S
-        b_stop = edge + 0.25 * m * S if below else edge - 0.25 * m * S      # clearly back inside = idea is wrong
-        b_rr = abs(nxt - b_trig) / max(abs(b_trig - b_stop), 1e-9)
-        lines.append(
-            f"B) IF IT BREAKS THROUGH FAST AND HOLDS -> {'SHORT' if below else 'LONG'}: a candle bigger than ~${2*bar:.2f} "
-            f"through the level, then 2-3 five-minute candles holding {'below' if below else 'above'} it. Don't market-order the first "
-            f"candle. Place a {'SELL-STOP' if below else 'BUY-STOP'} at {px(b_trig)}, just past the consolidation. "
-            f"Stop back inside the level at {px(b_stop)} ({pts(b_trig - b_stop)} risk). Target {px(nxt)} ({pts(nxt - b_trig)}, about 1:{b_rr:.1f}).")
-        # which scenario is favoured
-        if (k.verdict == "UP" and below) or (k.verdict == "DOWN" and not below):
-            fav = "A - the bias says this level should hold"
-        elif (k.verdict == "UP" and not below) or (k.verdict == "DOWN" and below):
-            fav = "B - the bias is pushing through this level"
+        if not extreme:
+            b_trig = far - 0.1 * m * S if below else far + 0.1 * m * S
+            b_stop = edge + 0.25 * m * S if below else edge - 0.25 * m * S
+            b_rr = abs(nxt - b_trig) / max(abs(b_trig - b_stop), 1e-9)
+            lines.append(
+                f"B) IF IT BREAKS THROUGH FAST AND HOLDS -> {'SHORT' if below else 'LONG'}: a candle bigger than ~${2*bar:.2f} "
+                f"through the level, then 2-3 five-minute candles holding {'below' if below else 'above'} it. Don't market-order the first "
+                f"candle. Place a {'SELL-STOP' if below else 'BUY-STOP'} at {px(b_trig)}, just past the consolidation. "
+                f"Stop back inside the level at {px(b_stop)} ({pts(b_trig - b_stop)} risk). Target {px(nxt)} ({pts(nxt - b_trig)}, about 1:{b_rr:.1f}).")
+        if extreme:
+            fav = "A - a 2-sigma stretch: take profits, don't chase and don't short"
+        elif day.startswith("EXPANSION"):
+            fav = f"B - it's an expansion/trend day ({d['day_why'][0]}), so breaks tend to run"
+        elif below and (day.startswith("MEAN") or k.verdict == "UP"):
+            fav = "A - " + ("dealers are long gamma, dips tend to get bought" if day.startswith("MEAN") else "the up bias says this level should hold")
+        elif below and k.verdict == "DOWN":
+            fav = "B - the down bias is pushing through this level"
         elif below:
             fav = "B slightly - historically breaks of the downside limit kept going more often than they bounced"
+        elif k.verdict == "UP":
+            fav = "B - the up bias is pushing through this level"
         else:
-            fav = "A - historically QQQ closed above the upside limit on only ~7% of days"
+            fav = "A - take profits; QQQ closed above the upside limit on only ~7-11% of days"
         lines.append(f"Favoured today: {fav}. If neither happens (price just drifts through slowly), stand aside.")
     return lines
 
@@ -2268,6 +2570,93 @@ def market_story(c: Ctx, k: Composite) -> str:
     return " ".join(bits)
 
 
+def _cap(t: str) -> str:
+    return t[:1].upper() + t[1:] if t else t
+
+
+def desk_note(c: Ctx, k: Composite) -> str:
+    """One synthesis: the regime, how the options / volatility / structure / cross-asset reads confirm or contradict
+    each other, and the stance that follows."""
+    S, m, d, i = c.spot, max(k.move, 1e-6), desk_context(c, k), c.info
+    lv = {nm: v for nm, v, _ in k.lv}
+    g = d.get("gamma")
+    out = []
+    # 1. regime
+    dt = d['day_type'].lower()
+    out.append(f"Today reads as {'an' if dt[0] in 'aeiou' else 'a'} {dt}: " + ", ".join(d["day_why"]) + ".")
+    # 2. volatility complex + options positioning, cross-checked
+    vt = []
+    if _ok(d["ts_back"]):
+        vt.append(f"VIX term structure is {'in backwardation (front > back, a stress signal)' if d['ts_back'] > 1 else 'in contango (normal)'} "
+                  f"at {d['ts_back']:.2f}" + (f", with 9-day vol {'above' if d['ts_front'] > 1 else 'below'} 30-day" if _ok(d["ts_front"]) else ""))
+    if "iv" in i:
+        vt.append(f"options are pricing {pc(i['iv'],0)} a year vs {pc(i['rv21'],0)} realised "
+                  f"({'expensive' if i['vrp'] > 0.02 else 'cheap' if i['vrp'] < -0.02 else 'fair'})")
+    if "garch_pctl" in i:
+        vt.append(f"GARCH puts today's swing at the {_ord(i['garch_pctl']*100)} percentile")
+    if vt:
+        out.append("On volatility, " + "; ".join(vt) + ".")
+    if g:
+        gx = (f"Dealers are {'long' if g['gex'] > 0 else 'short'} gamma (about ${abs(g['gex'])/1e6:,.0f}M per 1% move)"
+              + (f" with the flip at {f(g['flip'])}" if _ok(g.get("flip")) else "")
+              + (", so they tend to dampen moves" if d["gamma_regime"] == "long" else ", so moves can feed on themselves" if d["gamma_regime"] == "short" else ""))
+        walls = []
+        ul, dl = lv["Implied upside base"], lv["Implied downside base"]
+        if _ok(g.get("call_wall")):
+            rel = "right at" if abs(g["call_wall"] - ul) < 0.15 * m * S else "inside" if g["call_wall"] < ul else "beyond"
+            walls.append(f"the call wall at {f(g['call_wall'],0)} sits {rel} the upside limit ({f(ul)})")
+        if _ok(g.get("put_wall")):
+            rel = "right at" if abs(g["put_wall"] - dl) < 0.15 * m * S else "inside" if g["put_wall"] > dl else "beyond"
+            walls.append(f"the put wall at {f(g['put_wall'],0)} sits {rel} the downside limit ({f(dl)})")
+        txt = gx + (". " + _cap("; ".join(walls)) if walls else "")
+        if any("right at" in w for w in walls):
+            txt += ", so options positioning and the volatility model point to the same edges"
+        elif any("inside" in w for w in walls):
+            txt += ", so positioning may stop price before the statistical edge"
+        out.append(txt + "." + (f" Put/call open interest is {g['pc_oi']:.2f}." if _ok(g.get("pc_oi")) else ""))
+    else:
+        out.append("Options positioning isn't available for this run (no live chain), so the levels rest on the volatility models and price structure.")
+    # 3. trend / stretch vs the bias
+    tr = (f"The trend is a {d['trend']}" + (f" (price {'above' if S > d['sma200'] else 'below'} the 200-day at {f(d['sma200'])}, "
+                                               f"3-month momentum {pc(d['mom63'],1)})" if _ok(d["sma200"]) else "")
+          + f", and price is {d['stretch']} (RSI(2) {d['rsi2']:.0f}, {d['z20']:+.1f} sd from the 20-day).")
+    out.append(tr)
+    # 4. cross-asset
+    ca = []
+    if _ok(d["credit5"]):
+        ca.append(f"credit {'firming' if d['credit5'] > 0 else 'weakening'} (HYG vs LQD {pc(d['credit5'],1)} over 5 days)")
+    if _ok(d["dxy5"]):
+        ca.append(f"the dollar {'up' if d['dxy5'] > 0 else 'down'} {pc(abs(d['dxy5']),1)}")
+    if _ok(d["y10_5d_bp"]):
+        ca.append(f"10-year yields {d['y10_5d_bp']:+.0f}bp")
+    if _ok(d["semis5"]):
+        ca.append(f"semis {'leading' if d['semis5'] > 0 else 'lagging'} QQQ by {pc(abs(d['semis5']),1)}")
+    if ca:
+        out.append(f"Cross-asset reads {d['risk']}: " + ", ".join(ca) + ".")
+    # 5. structure + calendar
+    st = [f"QQQ opens {pc(d['gap'],2)} from yesterday's close ({abs(d['gap_z'])*100:.0f}% of a normal day)"]
+    if _ok(d["pm_high"]):
+        st.append(f"premarket ranged {f(d['pm_low'])}-{f(d['pm_high'])}")
+    st.append(f"yesterday's range was {f(d['pdl'])}-{f(d['pdh'])}" + (" (NR7)" if d["nr7"] else ""))
+    cal = (["it's OpEx day, so pinning near big strikes is common"] if d["opex_day"] else ["it's OpEx week"] if d["opex_week"] else [])
+    cal += ["it's the turn of the month, when index inflows are typically strong"] if d["turn_of_month"] else []
+    out.append(_cap("; ".join(st)) + "." + (" " + _cap("; ".join(cal)) + "." if cal else ""))
+    # 6. how it all lines up
+    if k.verdict in ("UP", "DOWN"):
+        names_for = [n for n, v in d["ctx_votes"].items() if v == (1 if k.verdict == "UP" else -1)]
+        names_vs = [n for n, v in d["ctx_votes"].items() if v == (-1 if k.verdict == "UP" else 1)]
+        out.append(f"Putting it together: the models lean {k.verdict.lower()}"
+                   + (f", supported by {', '.join(names_for)}" if names_for else "")
+                   + (f" but contradicted by {', '.join(names_vs)}" if names_vs else "")
+                   + f" - conviction {d['conviction']}. Stance: {d['stance']}.")
+    else:
+        lean = d["ctx_lean"]
+        out.append(f"Putting it together: the models have no directional edge"
+                   + (f"; the context leans {'up' if lean > 0 else 'down'} ({', '.join(n for n, v in d['ctx_votes'].items() if v)})" if lean else "; the context is split too")
+                   + f". Stance: {d['stance']}.")
+    return " ".join(out)
+
+
 def actual_text(c: Ctx, k: Composite) -> List[str]:
     """For replays: how the day really played out against the levels."""
     a = c.info.get("actual")
@@ -2312,8 +2701,10 @@ def summary_text(c: Ctx, k: Composite, res: List[Result]) -> str:
         "",
         "1. TODAY'S BIAS",
         bias_text(c, k, res),
+        f"Day type: {desk_context(c, k)['day_type']}  ->  {desk_context(c, k)['stance']}"
+        + (f"  (conviction {desk_context(c, k)['conviction']})" if k.verdict in ('UP', 'DOWN') else ""),
         "",
-        "TOP LEVELS TODAY  (the 2-3 levels with the best statistical backing)",
+        "KEY ZONES TODAY  (context: where independent methods agree)",
     ]
     for i, b in enumerate(best_levels(c, k), 1):
         px_txt = f"{b['zone'][0]:,.2f}-{b['zone'][1]:,.2f} | NQ {fut(c, b['zone'][0])}-{fut(c, b['zone'][1])}" if "zone" in b else f"{b['price']:,.2f} | NQ {fut(c, b['price'])}"
@@ -2321,22 +2712,14 @@ def summary_text(c: Ctx, k: Composite, res: List[Result]) -> str:
         L.append(f"        Why: {b['why']}.")
         if b["history"]:
             L.append(f"        History: {b['history']}.")
-        L.append("        How to take it:")
-        for ln in exec_plan(c, k, b):
-            L.append(f"          {ln}")
-    L.append("   Order types: LIMIT = rests at your price, fills only if price comes back to it (for fades). "
-             "STOP = triggers once price trades through it (for breakouts). MARKET = fills instantly at whatever price; "
-             "avoid it on fast candles.")
-    L.append("   Plans, not signals: in 2018-2026 testing no level made money as an automatic entry; waiting for the "
-             "confirmation is the part that helped.")
-    L += ["", "2. KEY LEVELS AND HOW TO REACT  (QQQ | NQ/MNQ)"]
+    L += ["", "2. ALL LEVELS  (context, QQQ | NQ/MNQ)"]
     for v, nm, what, react in level_ladder(c, k):
         L.append(f"   {v:>9,.2f} | {fut(c, v):>8}   {nm}")
         L.append(f"        What it is: {what}")
         L.append(f"        If price gets here: {react}")
     L += ["", "3. WHAT NOT TO DO"] + [f" - {d}" for d in donts_list(c, k)]
     L += ["", "4. HOW TO ENTER"] + [f" - {e}" for e in how_to_enter(c)]
-    L += ["", "5. WHAT'S HAPPENING IN THE MARKET", market_story(c, k)]
+    L += ["", "5. DESK NOTE - HOW TODAY FITS TOGETHER", desk_note(c, k)]
     act = actual_text(c, k)
     if act:
         L += ["", "6. WHAT ACTUALLY HAPPENED (replay check)"] + [f" - {x}" for x in act]
@@ -2383,53 +2766,205 @@ def _post(cfg: Config, payload: dict, files: Optional[dict] = None):
     raise RuntimeError("Discord rate limit: gave up")
 
 
+def reversal_levels(c: Ctx, k: Composite, n: int = 2) -> List[dict]:
+    """The n confluence zones most likely to produce a reversal today, with the reasons."""
+    S, m, d = c.spot, max(k.move, 1e-6), desk_context(c, k)
+    fam_w = {"options positioning": 0.5, "yesterday's structure": 0.3, "yesterday's volume": 0.3,
+             "volatility model": 0.2, "overnight structure": 0.2, "trend averages": 0.15, "order flow (Hawkes)": 0.0, "relative value": 0.0}
+    gam = 1.2 if d["gamma_regime"] == "long" else 0.8 if d["gamma_regime"] == "short" else 1.0
+    out = []
+    for z in confluence_zones(c, k):
+        x = abs(math.log(z["price"] / S))
+        if x < 0.3 * m or x > 2.2 * m:
+            continue
+        below = z["price"] < S
+        p_touch = min(0.95, 2 * (1 - float(Ncdf(x / (TOUCH_SCALE * m)))) * SIDE_ADJ["down" if below else "up"])
+        fams = z["families"]
+        # confluence matters more than proximity: sqrt dampens the reach probability, agreement is weighted up
+        score = math.sqrt(p_touch) * (1 + 0.8 * (len(fams) - 1) + sum(fam_w.get(f_, 0) for f_ in fams)) * (1.0 if below else 0.7) * gam
+        out.append(dict(price=z["price"], below=below, p=p_touch, fams=fams, names=list(dict.fromkeys(z["names"])), score=score))
+    out.sort(key=lambda r_: -r_["score"])
+    multi = [r_ for r_ in out if len(r_["fams"]) >= 2 and r_["p"] >= 0.15]
+    if len(multi) >= n:
+        out = multi                                     # when real confluence zones are in reach, use only those
+    for r_ in out:
+        r_["strength"] = "strong" if r_["score"] >= 1.2 else "medium" if r_["score"] >= 0.7 else "weak"
+    return out[:n]
+
+
+def compact_lines(c: Ctx, k: Composite, res: List[Result]) -> List[str]:
+    """Bias, range, fair value and the 2 best reversal levels with execution - nothing else."""
+    S, d, cfg = c.spot, desk_context(c, k), c.cfg
+    lv = {nm: v for nm, v, _ in k.lv}
+    nq = lambda x: f"{x:,.2f} (NQ {fut(c, x)})"           # every level: QQQ price, NQ equivalent in brackets
+    ratio = c.fut_ratio if c.fut_ratio == c.fut_ratio else 41.0
+    q = lambda pts: pts / ratio                       # NQ points -> QQQ dollars
+    L = []
+    gap = S / c.prev_close - 1
+    L.append(f"**NY Open · {c.now.strftime('%a %d %b')}**" + ("  ·  REPLAY" if cfg.as_of else "")
+             + f"  ·  QQQ {nq(S)}  ·  gap {pc(gap,2)}")
+    # ---- bias
+    bias = {"UP": "LEAN UP", "DOWN": "LEAN DOWN"}.get(k.verdict, "NO CLEAR BIAS")
+    conv = f", conviction {d['conviction']}" if k.verdict in ("UP", "DOWN") else ""
+    L.append(f"**Bias:** {bias} - {k.p_up*100:.0f}% chance of closing above the open{conv} · "
+             f"{d['day_type'].split(' /')[0].lower()} day ({d['day_why'][0].split(' (')[0]})")
+    # ---- range
+    L.append(f"**Range:** {nq(lv['Implied downside base'])} – {nq(lv['Implied upside base'])} · ±{pc(k.move,2)} · ~78% of days close inside · "
+             f"extremes {nq(lv['Stretched downside'])} / {nq(lv['Stretched upside'])}, <3% of days close beyond")
+    # ---- fair value
+    fv = []
+    fair = c.info.get("pair_fair")
+    if _ok(fair):
+        fv.append(f"{nq(fair)} vs SPY ({'price above value' if S > fair else 'price below value'}, {pc(abs(S/fair-1),1)} away)")
+    g = d.get("gamma")
+    if g and _ok(g.get("max_pain")):
+        fv.append(f"options pin (max pain) {nq(g['max_pain'])}")
+    if g and _ok(g.get("flip")):
+        fv.append(f"gamma flip {nq(g['flip'])}")
+    L.append("**Fair value:** " + (" · ".join(fv) if fv else "n/a today"))
+    # ---- the 2 reversal levels
+    calm = d["gamma_regime"] == "long" or d["day_type"].startswith("MEAN")
+    plans = []
+    for i_, r in enumerate(reversal_levels(c, k), 1):
+        lvl = r["price"]
+        nmf = len(r["fams"])
+        short_f = {"order flow (Hawkes)": "Hawkes order flow"}
+        fam_txt = ", ".join(short_f.get(f_, f_) for f_ in r["fams"][:3])
+        side = "BUY" if r["below"] else "SELL"
+        L.append(f"**{i_}. {side} {nq(lvl)}** - {' + '.join(x.title() for x in r['names'][:2])}: "
+                 + (f"{nmf} independent methods agree ({fam_txt})" if nmf > 1 else f"{fam_txt}")
+                 + f", {r['p']*100:.0f}% chance price reaches it · strength: {r['strength']}")
+        # every instruction carries exact NQ prices: entry, stop, TP1 (back to the open), TP2 (150 pts)
+        stop_d, tgt_d = q(cfg.stop_pts), q(cfg.target_pts)
+        if r["below"]:
+            if calm or nmf >= 3:
+                entry = lvl + q(2)
+                sl, tp2 = lvl - stop_d, entry + tgt_d
+                how = (f"LIMIT BUY {nq(entry)} (place it before price arrives) · SL {nq(sl)} · TP1 {nq(S)} · TP2 {nq(tp2)}")
+            else:
+                entry = lvl
+                sl, tp2 = lvl - stop_d, lvl + tgt_d
+                how = (f"Wait for a 5-min candle to CLOSE back above {nq(lvl)} → MARKET BUY ≈{nq(entry)} · SL {nq(sl)} · "
+                       f"TP1 {nq(S)} · TP2 {nq(tp2)} (skip if that candle's low is already below {nq(sl)})")
+        else:
+            entry = lvl
+            sl, tp2 = lvl + stop_d, lvl - tgt_d
+            how = (f"Wait for a 5-min candle to CLOSE back below {nq(lvl)} → MARKET SELL ≈{nq(entry)}, small size · SL {nq(sl)} · "
+                   f"TP1 {nq(S)} · TP2 {nq(tp2)} (skip if that candle's high is already above {nq(sl)})")
+        use_tp1 = abs(entry - S) * ratio >= cfg.stop_pts
+        if not use_tp1:                                               # open too close to be a sensible first target
+            how = how.replace(f"TP1 {nq(S)} · ", "")
+        plans.append(dict(n=i_, side=1 if r["below"] else -1, level=lvl, entry=entry, sl=sl, tp1=S if use_tp1 else None, tp2=tp2,
+                          limit=how.startswith("LIMIT")))
+        L.append(f"   ↳ {how}")
+    if cfg.as_of:
+        L += replay_check(c, k, plans)
+    return L[:15]
+
+
+def _fetch_day_1m(cfg: Config, day) -> Optional[pd.DataFrame]:
+    """Regular-session 1-minute QQQ bars for a past day (Yahoo keeps about 30 days of 1-minute data)."""
+    q = _flat(yf.download(cfg.equity, start=day.isoformat(), end=(day + timedelta(days=1)).isoformat(),
+                          interval="1m", auto_adjust=False, progress=False)).rename(columns=str.lower)
+    if q.empty:
+        return None
+    if q.index.tz is None:
+        q.index = q.index.tz_localize("UTC")
+    q.index = q.index.tz_convert(ET)
+    return q.between_time("09:30", "15:59")
+
+
+def replay_check(c: Ctx, k: Composite, plans: List[dict], bars: Optional[pd.DataFrame] = None) -> List[str]:
+    """Play each instruction out on the real 1-minute bars of the replayed day."""
+    day = c.now.date()
+    nq = lambda x: f"{x:,.2f} (NQ {fut(c, x)})"
+    ratio = c.fut_ratio if c.fut_ratio == c.fut_ratio else 41.0
+    try:
+        bars = bars if bars is not None else _fetch_day_1m(c.cfg, day)
+    except Exception as e:
+        bars = None
+        log.warning("replay 1m fetch failed: %s", e)
+    a = c.info.get("actual")
+    out = []
+    if a:
+        lv = {nm: v for nm, v, _ in k.lv}
+        inside = lv["Implied downside base"] <= a["close"] <= lv["Implied upside base"]
+        out.append(f"**What happened:** high {nq(a['high'])} · low {nq(a['low'])} · close {nq(a['close'])} → "
+                   f"{'closed INSIDE the range' if inside else 'closed OUTSIDE the range'}")
+    if bars is None or len(bars) < 30:
+        out.append("(1-minute data for this day isn't available - Yahoo only keeps about 30 days - so the trades can't be checked)")
+        return out
+    hi, lo, cl = bars["high"].values, bars["low"].values, bars["close"].values
+    tm = [x.hour * 60 + x.minute for x in bars.index]
+    c5 = bars["close"].resample("5min").last()
+    l5, h5 = bars["low"].resample("5min").min(), bars["high"].resample("5min").max()
+    for pl in plans:
+        sd, L = pl["side"], pl["level"]
+        name = f"{pl['n']}. {'BUY' if sd > 0 else 'SELL'} {nq(L)}"
+        i0, entry = None, pl["entry"]
+        if pl["limit"]:
+            for i in range(len(bars)):
+                if tm[i] > 15 * 60 + 30:
+                    break
+                if (sd > 0 and lo[i] <= entry) or (sd < 0 and hi[i] >= entry):
+                    i0 = i
+                    break
+        else:
+            broke = False
+            for t5, cc in c5.items():
+                if t5.hour * 60 + t5.minute > 15 * 60 + 25:
+                    break
+                lo5, hi5 = l5[t5], h5[t5]
+                if not broke and ((sd > 0 and lo5 < L) or (sd < 0 and hi5 > L)):
+                    broke = True
+                if broke and ((sd > 0 and cc > L) or (sd < 0 and cc < L)):
+                    if (sd > 0 and lo5 <= pl["sl"]) or (sd < 0 and hi5 >= pl["sl"]):
+                        out.append(f"{name}: confirmation candle went past the stop at {(t5 + timedelta(minutes=5)).strftime('%H:%M')} → skipped (rule)")
+                        i0 = -1
+                        break
+                    end = t5 + timedelta(minutes=5)
+                    j = int(np.searchsorted(bars.index.values, end.to_datetime64()))
+                    if j < len(bars):
+                        i0, entry = j, float(cc)
+                    break
+        if i0 == -1:
+            continue
+        if i0 is None:
+            out.append(f"{name}: never triggered (price {'did not reach' if pl['limit'] else 'did not break and reclaim'} the level)")
+            continue
+        sl, tp1, tp2 = pl["sl"], pl["tp1"], pl["tp2"]
+        if tp1 is not None and sd * (tp1 - entry) <= 0:
+            tp1 = None                                   # the fill was already past TP1 - it no longer applies
+        got_tp1, res, pts = False, None, 0.0
+        for j in range(i0, len(bars)):
+            if (sd > 0 and lo[j] <= sl) or (sd < 0 and hi[j] >= sl):
+                res = f"stopped at {nq(sl)} {bars.index[j].strftime('%H:%M')}"
+                pts = sd * (sl - entry) * ratio
+                break
+            if j > i0 and tp1 is not None and not got_tp1 and ((sd > 0 and hi[j] >= tp1) or (sd < 0 and lo[j] <= tp1)):
+                got_tp1 = True
+                tp1_txt = f"TP1 {nq(tp1)} {bars.index[j].strftime('%H:%M')}"
+            if j > i0 and ((sd > 0 and hi[j] >= tp2) or (sd < 0 and lo[j] <= tp2)):
+                res = f"TP2 {nq(tp2)} hit {bars.index[j].strftime('%H:%M')}"
+                pts = sd * (tp2 - entry) * ratio
+                break
+        if res is None:
+            res = f"still open at the close {nq(cl[-1])}"
+            pts = sd * (cl[-1] - entry) * ratio
+        steps = [f"filled ≈{nq(entry)} {bars.index[i0].strftime('%H:%M')}"] + ([tp1_txt] if got_tp1 else []) + [res]
+        out.append(f"{name}: " + " → ".join(steps) + f" = {pts:+.0f} pts if held to the end"
+                   + (" (TP1 was reached first)" if got_tp1 and pts < 0 else ""))
+    return out
+
+
 def send_discord(cfg: Config, c: Ctx, k: Composite, res: List[Result], report: str):
+    """One compact card (<= 15 lines). The full report rides along as an attachment."""
     color = 0xE74C3C if k.verdict == "DOWN" else 0x2ECC71 if k.verdict == "UP" else 0x95A5A6
-    S = c.spot
-    top = sorted([r for r in res if r.ok and r.weight > 0], key=lambda r: -abs(r.signal * r.weight))[:6]
-    head = {
-        "title": f"NY Open Playbook  |  {c.now.strftime('%a %d %b %Y') if cfg.as_of else c.now.strftime('%a %d %b')}" + ("  |  REPLAY" if cfg.as_of else ""),
-        "description": (f"{cfg.equity} **{S:,.2f}** (gap {pc(S/c.prev_close-1,2)})  ·  normal move ±{pc(k.move,2)} = ±${S*k.move:,.2f}\n\n"
-                        f"**Today's bias:** {bias_text(c, k, res)}")[:4000],
-        "color": color,
-        "fields": [
-            {"name": "What not to do", "value": "\n".join(f"✋ {d}" for d in donts_list(c, k))[:1024] or "-", "inline": False},
-            {"name": "σ blend", "value": "\n".join(f"{n}: {pc(v,2)}" for n, v in k.move_parts.items())[:1024] or "n/a", "inline": True},
-            {"name": "Top votes", "value": "\n".join(f"{r.title.split(' (')[0][:34]}: {r.signal:+.2f}" for r in top)[:1024] or "n/a", "inline": True},
-        ],
-        "footer": {"text": "Statistical context only · not financial advice" + (" · DEMO DATA" if cfg.demo else "")},
-    }
-    ladder = "\n\n".join(f"**{v:,.2f}** (NQ {fut(c, v)}) · **{nm}**\n{what}\n👉 {react}" for v, nm, what, react in level_ladder(c, k))
-    levels = {"title": "Key levels & how to react", "description": ladder[:4000], "color": color}
-    tops = []
-    for n_, b in enumerate(best_levels(c, k), 1):
-        rng = (f"{b['zone'][0]:,.2f}-{b['zone'][1]:,.2f} (NQ {fut(c, b['zone'][0])}-{fut(c, b['zone'][1])})" if "zone" in b
-               else f"{b['price']:,.2f} (NQ {fut(c, b['price'])})")
-        tops.append(f"**#{n_}  {rng} · {b['name']}**\n{b['why']}.\n" + "\n".join(f"▸ {x}" for x in exec_plan(c, k, b)))
-    top_card = {"title": "🎯 Top levels today & how to take them",
-                "description": ("\n\n".join(tops) + "\n\n*LIMIT = waits for your price · STOP = triggers on a break · "
-                                "avoid MARKET orders on fast candles. Plans, not signals.*")[:4000] or "-", "color": color}
-    _post(cfg, {"username": "NY Open Quant Desk", "embeds": [head, top_card]},
-          files={"files[0]": ("quant_full_report.txt", report.encode("utf-8"), "text/plain")})
-    enter = {"title": "How to enter", "description": "\n\n".join(f"• {e}" for e in how_to_enter(c))[:4000] or "-", "color": color}
-    story = {"title": "What's happening in the market", "description": market_story(c, k)[:4000] or "-", "color": color}
-    embeds = [levels, enter, story]
-    act = actual_text(c, k)
-    if act:
-        embeds.append({"title": f"Replay check - what actually happened on {c.now.strftime('%a %d %b %Y')}",
-                       "description": "\n".join(f"• {x}" for x in act)[:4000], "color": color})
-    _post(cfg, {"username": "NY Open Quant Desk", "embeds": embeds})
-    sections: Dict[str, List[Result]] = {}
-    for r in res:
-        sections.setdefault(r.section, []).append(r)
-    for sec, rs in sections.items():
-        fields = []
-        for r in rs:
-            tag = "" if r.ok else " (skipped)"
-            vote = f"\n`vote {r.signal:+.2f} × w{r.weight:.1f}`" if r.ok and r.weight > 0 else ""
-            fields.append({"name": (r.title + tag)[:256], "value": (r.headline[:900] + vote)[:1024] or "-", "inline": False})
-        _post(cfg, {"username": "NY Open Quant Desk", "embeds": [{"title": sec, "color": color, "fields": fields}]})
-        time.sleep(0.6)
+    lines = compact_lines(c, k, res)
+    card = {"description": "\n".join(lines)[:4000], "color": color,
+            "footer": {"text": "Full report attached · statistical context, not financial advice" + (" · DEMO DATA" if cfg.demo else "")}}
+    _post(cfg, {"username": "NY Open Quant Desk", "embeds": [card]},
+          files={"files[0]": ("full_report.txt", report.encode("utf-8"), "text/plain")})
 
 
 # =============================================================================
