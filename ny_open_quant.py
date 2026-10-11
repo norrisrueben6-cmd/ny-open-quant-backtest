@@ -2857,7 +2857,6 @@ def compact_lines(c: Ctx, k: Composite, res: List[Result]) -> List[str]:
         plans.append(dict(n=i_, side=1 if r["below"] else -1, level=lvl, entry=entry, sl=sl, tp1=S if use_tp1 else None, tp2=tp2,
                           limit=how.startswith("LIMIT")))
         L.append(f"   ↳ {how}")
-    c.info["plans"] = plans
     if cfg.as_of:
         L += replay_check(c, k, plans)
     return L[:15]
@@ -2873,67 +2872,6 @@ def _fetch_day_1m(cfg: Config, day) -> Optional[pd.DataFrame]:
         q.index = q.index.tz_localize("UTC")
     q.index = q.index.tz_convert(ET)
     return q.between_time("09:30", "15:59")
-
-
-def simulate_plan(pl: dict, bars: pd.DataFrame, ratio: float) -> dict:
-    """Play one card instruction out on real intraday bars (1- or 5-minute, regular session, ET index).
-    Limit: fills when price trades to the entry. Confirmation: price must break the level, then a 5-min candle must
-    close back through it -> market entry at that close (skipped if that candle already went past the stop).
-    Exits: stop first if stop and target fall inside one bar; TP1 (the open) only counts if it's on the profit side
-    of the fill; TP2 or the stop ends the trade; anything open is closed at the last bar of the session."""
-    sd, L = pl["side"], pl["level"]
-    out = dict(status="no fill", entry=np.nan, entry_t=None, tp1_hit=False, tp1_t=None, exit_reason=None,
-               exit_px=np.nan, exit_t=None, pts_full=0.0, pts_split=0.0, risk_pts=np.nan)
-    if bars is None or len(bars) < 10:
-        out["status"] = "no data"
-        return out
-    hi, lo, cl = bars["high"].values, bars["low"].values, bars["close"].values
-    tm = np.array([x.hour * 60 + x.minute for x in bars.index])
-    i0, entry = None, pl["entry"]
-    if pl["limit"]:
-        hit = np.where((tm <= 15 * 60 + 30) & ((lo <= entry) if sd > 0 else (hi >= entry)))[0]
-        if len(hit):
-            i0 = int(hit[0])
-    else:
-        c5 = bars["close"].resample("5min").last().dropna()
-        l5, h5 = bars["low"].resample("5min").min(), bars["high"].resample("5min").max()
-        broke = False
-        for t5, cc in c5.items():
-            if t5.hour * 60 + t5.minute > 15 * 60 + 25:
-                break
-            lo5, hi5 = l5[t5], h5[t5]
-            if not broke and ((sd > 0 and lo5 < L) or (sd < 0 and hi5 > L)):
-                broke = True
-            if broke and ((sd > 0 and cc > L) or (sd < 0 and cc < L)):
-                if (sd > 0 and lo5 <= pl["sl"]) or (sd < 0 and hi5 >= pl["sl"]):
-                    out.update(status="skipped", entry_t=t5 + timedelta(minutes=5))
-                    return out
-                j = int(np.searchsorted(bars.index.values, (t5 + timedelta(minutes=5)).to_datetime64()))
-                if j < len(bars):
-                    i0, entry = j, float(cc)
-                break
-    if i0 is None:
-        return out
-    sl, tp1, tp2 = pl["sl"], pl["tp1"], pl["tp2"]
-    if tp1 is not None and sd * (tp1 - entry) <= 0:
-        tp1 = None
-    out.update(status="filled", entry=entry, entry_t=bars.index[i0], risk_pts=sd * (entry - sl) * ratio)
-    exit_px, reason, exit_i = None, None, None
-    for j in range(i0, len(bars)):
-        if (sd > 0 and lo[j] <= sl) or (sd < 0 and hi[j] >= sl):
-            exit_px, reason, exit_i = sl, "STOP", j
-            break
-        if j > i0 and tp1 is not None and not out["tp1_hit"] and ((sd > 0 and hi[j] >= tp1) or (sd < 0 and lo[j] <= tp1)):
-            out.update(tp1_hit=True, tp1_t=bars.index[j])
-        if j > i0 and ((sd > 0 and hi[j] >= tp2) or (sd < 0 and lo[j] <= tp2)):
-            exit_px, reason, exit_i = tp2, "TP2", j
-            break
-    if exit_px is None:
-        exit_px, reason, exit_i = float(cl[-1]), "CLOSE", len(bars) - 1
-    full = sd * (exit_px - entry) * ratio
-    split = 0.5 * sd * (tp1 - entry) * ratio + 0.5 * full if out["tp1_hit"] else full
-    out.update(exit_reason=reason, exit_px=exit_px, exit_t=bars.index[exit_i], pts_full=full, pts_split=split)
-    return out
 
 
 def replay_check(c: Ctx, k: Composite, plans: List[dict], bars: Optional[pd.DataFrame] = None) -> List[str]:
@@ -2956,20 +2894,66 @@ def replay_check(c: Ctx, k: Composite, plans: List[dict], bars: Optional[pd.Data
     if bars is None or len(bars) < 30:
         out.append("(1-minute data for this day isn't available - Yahoo only keeps about 30 days - so the trades can't be checked)")
         return out
+    hi, lo, cl = bars["high"].values, bars["low"].values, bars["close"].values
+    tm = [x.hour * 60 + x.minute for x in bars.index]
+    c5 = bars["close"].resample("5min").last()
+    l5, h5 = bars["low"].resample("5min").min(), bars["high"].resample("5min").max()
     for pl in plans:
-        r = simulate_plan(pl, bars, ratio)
-        name = f"{pl['n']}. {'BUY' if pl['side'] > 0 else 'SELL'} {nq(pl['level'])}"
-        if r["status"] == "skipped":
-            out.append(f"{name}: confirmation candle went past the stop at {r['entry_t'].strftime('%H:%M')} → skipped (rule)")
-        elif r["status"] != "filled":
-            out.append(f"{name}: never triggered (price {'did not reach' if pl['limit'] else 'did not break and reclaim'} the level)")
+        sd, L = pl["side"], pl["level"]
+        name = f"{pl['n']}. {'BUY' if sd > 0 else 'SELL'} {nq(L)}"
+        i0, entry = None, pl["entry"]
+        if pl["limit"]:
+            for i in range(len(bars)):
+                if tm[i] > 15 * 60 + 30:
+                    break
+                if (sd > 0 and lo[i] <= entry) or (sd < 0 and hi[i] >= entry):
+                    i0 = i
+                    break
         else:
-            steps = [f"filled ≈{nq(r['entry'])} {r['entry_t'].strftime('%H:%M')}"]
-            if r["tp1_hit"]:
-                steps.append(f"TP1 {r['tp1_t'].strftime('%H:%M')}")
-            ex = {"STOP": "stopped", "TP2": "TP2 hit", "CLOSE": "closed at the bell"}[r["exit_reason"]]
-            steps.append(f"{ex} {nq(r['exit_px'])} {r['exit_t'].strftime('%H:%M')}")
-            out.append(f"{name}: " + " → ".join(steps) + f" = {r['pts_full']:+.0f} pts (half off at TP1: {r['pts_split']:+.0f})")
+            broke = False
+            for t5, cc in c5.items():
+                if t5.hour * 60 + t5.minute > 15 * 60 + 25:
+                    break
+                lo5, hi5 = l5[t5], h5[t5]
+                if not broke and ((sd > 0 and lo5 < L) or (sd < 0 and hi5 > L)):
+                    broke = True
+                if broke and ((sd > 0 and cc > L) or (sd < 0 and cc < L)):
+                    if (sd > 0 and lo5 <= pl["sl"]) or (sd < 0 and hi5 >= pl["sl"]):
+                        out.append(f"{name}: confirmation candle went past the stop at {(t5 + timedelta(minutes=5)).strftime('%H:%M')} → skipped (rule)")
+                        i0 = -1
+                        break
+                    end = t5 + timedelta(minutes=5)
+                    j = int(np.searchsorted(bars.index.values, end.to_datetime64()))
+                    if j < len(bars):
+                        i0, entry = j, float(cc)
+                    break
+        if i0 == -1:
+            continue
+        if i0 is None:
+            out.append(f"{name}: never triggered (price {'did not reach' if pl['limit'] else 'did not break and reclaim'} the level)")
+            continue
+        sl, tp1, tp2 = pl["sl"], pl["tp1"], pl["tp2"]
+        if tp1 is not None and sd * (tp1 - entry) <= 0:
+            tp1 = None                                   # the fill was already past TP1 - it no longer applies
+        got_tp1, res, pts = False, None, 0.0
+        for j in range(i0, len(bars)):
+            if (sd > 0 and lo[j] <= sl) or (sd < 0 and hi[j] >= sl):
+                res = f"stopped at {nq(sl)} {bars.index[j].strftime('%H:%M')}"
+                pts = sd * (sl - entry) * ratio
+                break
+            if j > i0 and tp1 is not None and not got_tp1 and ((sd > 0 and hi[j] >= tp1) or (sd < 0 and lo[j] <= tp1)):
+                got_tp1 = True
+                tp1_txt = f"TP1 {nq(tp1)} {bars.index[j].strftime('%H:%M')}"
+            if j > i0 and ((sd > 0 and hi[j] >= tp2) or (sd < 0 and lo[j] <= tp2)):
+                res = f"TP2 {nq(tp2)} hit {bars.index[j].strftime('%H:%M')}"
+                pts = sd * (tp2 - entry) * ratio
+                break
+        if res is None:
+            res = f"still open at the close {nq(cl[-1])}"
+            pts = sd * (cl[-1] - entry) * ratio
+        steps = [f"filled ≈{nq(entry)} {bars.index[i0].strftime('%H:%M')}"] + ([tp1_txt] if got_tp1 else []) + [res]
+        out.append(f"{name}: " + " → ".join(steps) + f" = {pts:+.0f} pts if held to the end"
+                   + (" (TP1 was reached first)" if got_tp1 and pts < 0 else ""))
     return out
 
 
